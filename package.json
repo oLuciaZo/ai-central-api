@@ -1,0 +1,27 @@
+{
+  "name": "ai-central-api",
+  "version": "1.0.0",
+  "description": "MCP with Claude",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/oLuciaZo/ai-central-api.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/oLuciaZo/ai-central-api/issues"
+  },
+  "homepage": "https://github.com/oLuciaZo/ai-central-api#readme",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "axios": "^1.16.0",
+    "fastmcp": "^4.0.1",
+    "zod": "^4.4.3"
+  }
+}
