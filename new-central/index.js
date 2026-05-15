@@ -378,6 +378,147 @@ server.addTool({
     }
 });
 
+// ── Tool: Get AP Radio Channel Utilization Trends ───────────────────────────
+// ดึงข้อมูล Channel Utilization Trends ของ radio บน AP ที่ระบุ
+server.addTool({
+    name: "get_ap_radio_channel_utilization_trends",
+    description: "Retrieve channel utilization trend data for a specific radio on an AP from New Aruba Central. Calls GET /network-monitoring/v1/aps/{serialnumber}/radios/{radio}/channel-utilization-trends.",
+    parameters: z.object({
+        serialnumber: z.string().describe("Serial number of the AP"),
+        radio: z.string().describe("Radio identifier, e.g. '0' (2.4 GHz), '1' (5 GHz), '2' (6 GHz)")
+    }),
+    execute: async (args) => {
+        const { serialnumber, radio } = args;
+
+        try {
+            const token = await getAccessToken();
+            const baseUrl = CENTRAL_BASE_URL.replace(/\/$/, "");
+            const apiUrl = `${baseUrl}/network-monitoring/v1/aps/${encodeURIComponent(serialnumber)}/radios/${encodeURIComponent(radio)}/channel-utilization-trends`;
+
+            const response = await axios.get(apiUrl, {
+                headers: {
+                    "Authorization": `Bearer ${token}`,
+                    "accept": "application/json"
+                }
+            });
+
+            return `Channel utilization trends for AP '${serialnumber}' radio '${radio}':\n${JSON.stringify(response.data, null, 2)}`;
+        } catch (error) {
+            const status = error.response?.status;
+            const responseData = error.response?.data;
+            const errorMsg = responseData?.message || responseData?.description || error.message;
+            const baseUrl = CENTRAL_BASE_URL.replace(/\/$/, "");
+            const debugInfo = [
+                `Status: ${status}`,
+                `URL: ${baseUrl}/network-monitoring/v1/aps/${encodeURIComponent(serialnumber)}/radios/${encodeURIComponent(radio)}/channel-utilization-trends`,
+                `Error: ${errorMsg}`,
+                responseData ? `Response body: ${JSON.stringify(responseData)}` : null
+            ].filter(Boolean).join("\n");
+
+            throw new Error(`Failed to get channel utilization trends.\n${debugInfo}`);
+        }
+    }
+});
+
+// ── Tool: Get AP Radio Detail with Bandwidth Advisory ───────────────────────
+// ดึงข้อมูลสถานะ radio ทั้งหมดของ AP พร้อมวิเคราะห์ channel utilization
+// และให้คำแนะนำปรับ bandwidth เพื่อลด interference หรือเพิ่ม throughput
+server.addTool({
+    name: "get_ap_radio_detail",
+    description: `Get current radio status for an AP including channelUtilization, band, bandwidth, and drops.
+Analyses each radio and provides actionable recommendations:
+- HIGH utilization (>70 %): suggests reducing bandwidth (e.g. 80 MHz → 40 MHz) to spread load across more channels and reduce interference.
+- LOW utilization (<30 %): suggests increasing bandwidth (e.g. 40 MHz → 80 MHz / 160 MHz) to gain more throughput when the channel is clean.
+- MODERATE utilization (30–70 %): reports current state as healthy.
+Use together with 'get_ap_radio_channel_utilization_trends' for trend-based analysis.
+Calls GET /network-monitoring/v1/aps/{serialnumber}/radios.`,
+    parameters: z.object({
+        serialnumber: z.string().describe("Serial number of the AP to inspect")
+    }),
+    execute: async (args) => {
+        const { serialnumber } = args;
+
+        try {
+            const token = await getAccessToken();
+            const baseUrl = CENTRAL_BASE_URL.replace(/\/$/, "");
+            const apiUrl = `${baseUrl}/network-monitoring/v1/aps/${encodeURIComponent(serialnumber)}/radios`;
+
+            const response = await axios.get(apiUrl, {
+                headers: {
+                    "Authorization": `Bearer ${token}`,
+                    "accept": "application/json"
+                }
+            });
+
+            const radios = response.data?.radios ?? response.data ?? [];
+
+            if (!Array.isArray(radios) || radios.length === 0) {
+                return `AP '${serialnumber}': No radio data returned from the API.\nRaw response: ${JSON.stringify(response.data, null, 2)}`;
+            }
+
+            // ── Build a structured report per radio ──────────────────────────
+            const lines = [`📡 AP Radio Detail Report — Serial: ${serialnumber}\n`];
+
+            for (const radio of radios) {
+                const index          = radio.index          ?? radio.radio_number ?? "?";
+                const band           = radio.band           ?? radio.radio_band   ?? "N/A";
+                const bandwidth      = radio.bandwidth      ?? radio.channel_width ?? "N/A";
+                const channel        = radio.channel        ?? "N/A";
+                const utilization    = radio.channel_utilization ?? radio.channelUtilization ?? null;
+                const drops          = radio.drops          ?? radio.tx_drops     ?? "N/A";
+                const txPower        = radio.tx_power       ?? "N/A";
+                const status         = radio.status         ?? "N/A";
+
+                // ── Bandwidth advisory ───────────────────────────────────────
+                let advisory = "";
+                if (utilization !== null && utilization !== undefined) {
+                    const util = Number(utilization);
+                    if (util > 70) {
+                        advisory = `⚠️  HIGH utilization (${util}%): Consider REDUCING bandwidth (e.g. ${bandwidth} MHz → lower) to widen channel availability and reduce co-channel interference. Also review neighbouring APs for channel overlap.`;
+                    } else if (util < 30) {
+                        advisory = `✅ LOW utilization (${util}%): Channel is clean. Consider INCREASING bandwidth (e.g. ${bandwidth} MHz → 80/160 MHz) to boost maximum throughput for connected clients.`;
+                    } else {
+                        advisory = `🟢 MODERATE utilization (${util}%): Current bandwidth (${bandwidth} MHz) appears healthy. Monitor trends with 'get_ap_radio_channel_utilization_trends'.`;
+                    }
+                } else {
+                    advisory = `ℹ️  Channel utilization data not available for this radio.`;
+                }
+
+                lines.push(
+                    `── Radio ${index} (${band}) ──────────────────────────`,
+                    `  Status          : ${status}`,
+                    `  Band            : ${band}`,
+                    `  Channel         : ${channel}`,
+                    `  Bandwidth       : ${bandwidth} MHz`,
+                    `  Channel Util.   : ${utilization !== null && utilization !== undefined ? utilization + "%" : "N/A"}`,
+                    `  Drops           : ${drops}`,
+                    `  TX Power        : ${txPower} dBm`,
+                    ``,
+                    `  📋 Advisory: ${advisory}`,
+                    ``
+                );
+            }
+
+            lines.push(`\n💡 Tip: Run 'get_ap_radio_channel_utilization_trends' for each radio index above to see historical utilization patterns before making bandwidth changes.`);
+
+            return lines.join("\n");
+        } catch (error) {
+            const status = error.response?.status;
+            const responseData = error.response?.data;
+            const errorMsg = responseData?.message || responseData?.description || error.message;
+            const baseUrl = CENTRAL_BASE_URL.replace(/\/$/, "");
+            const debugInfo = [
+                `Status: ${status}`,
+                `URL: ${baseUrl}/network-monitoring/v1/aps/${encodeURIComponent(serialnumber)}/radios`,
+                `Error: ${errorMsg}`,
+                responseData ? `Response body: ${JSON.stringify(responseData)}` : null
+            ].filter(Boolean).join("\n");
+
+            throw new Error(`Failed to get AP radio detail.\n${debugInfo}`);
+        }
+    }
+});
+
 // เปิดการเชื่อมต่อ
 server.start();
 
