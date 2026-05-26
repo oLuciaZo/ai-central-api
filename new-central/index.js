@@ -519,6 +519,331 @@ Calls GET /network-monitoring/v1/aps/{serialnumber}/radios.`,
     }
 });
 
+// ── Tool: Analyze WLAN SSID Best Practice ──────────────────────────────────
+// วิเคราะห์ SSID profiles ตาม best practice และส่งกลับ advisory report
+server.addTool({
+    name: "analyze_wlan_ssid_best_practice",
+    description: `Analyze one or more WLAN SSID profiles against Aruba best-practice rules and return a detailed advisory report per SSID.
+
+Best-practice checks performed:
+  • broadcast-filter-ipv4 : must be BCAST_FILTER_ARP or BCAST_FILTER_ALL (not NONE)
+  • dot11r              : should be false (fast-roaming via FT can cause issues with some clients)
+  • dot11k              : optional but recommended — flagged as advisory if missing/false
+  • basic-rates (g & a) : lowest value must be ≥ 24 Mbps (RATE_24MB) — 6/9/12/18 Mbps penalise airtime
+  • tx-rates   (g & a)  : lowest value must be ≥ 24 Mbps
+  • opmode              : WPA3_SAE or WPA3_SAE_ECC recommended; WPA2_PSK flagged; open/WEP is a FAIL
+  • wpa3-transition-mode-enable: when true, reminds operator to query which clients still lack WPA3 support
+  • auth-req-thresh     : must be ≥ 20 (0 = unlimited = risk of auth storms)
+
+Supply the full wlan-ssid JSON (single object OR { "wlan-ssid": [...] } array).`,
+    parameters: z.object({
+        payload: z.string().describe(
+            "JSON string of the WLAN SSID config — either a single SSID object or a { \"wlan-ssid\": [...] } wrapper. Paste the raw config JSON here."
+        )
+    }),
+    execute: async (args) => {
+        // ── helpers ────────────────────────────────────────────────────────────
+        const RATE_MB = {
+            "RATE_1MB":   1,  "RATE_2MB":   2,  "RATE_5_5MB": 5.5,
+            "RATE_6MB":   6,  "RATE_9MB":   9,  "RATE_11MB":  11,
+            "RATE_12MB":  12, "RATE_18MB":  18, "RATE_24MB":  24,
+            "RATE_36MB":  36, "RATE_48MB":  48, "RATE_54MB":  54
+        };
+
+        const rateValue = (rateStr) => RATE_MB[rateStr] ?? parseFloat(rateStr) ?? 0;
+
+        const minRate = (rateArray) => {
+            if (!Array.isArray(rateArray) || rateArray.length === 0) return null;
+            return Math.min(...rateArray.map(rateValue));
+        };
+
+        // WPA3-capable opmodes
+        const WPA3_MODES = new Set([
+            "WPA3_SAE", "WPA3_SAE_ECC",
+            "WPA3_192BIT", "WPA3_OWE",
+            "WPA3_SAE_TRANSITION"   // deprecated alias — still WPA3
+        ]);
+        // opmodes that are open/WEP — critical fail
+        const INSECURE_MODES = new Set([
+            "OPEN", "WEP", "NONE", "OPENSYSTEM"
+        ]);
+
+        // ── parse input ────────────────────────────────────────────────────────
+        let ssidList = [];
+        try {
+            const parsed = JSON.parse(args.payload);
+            if (Array.isArray(parsed["wlan-ssid"])) {
+                ssidList = parsed["wlan-ssid"];
+            } else if (Array.isArray(parsed)) {
+                ssidList = parsed;
+            } else if (parsed && typeof parsed === "object") {
+                ssidList = [parsed];
+            } else {
+                throw new Error("Payload must be a SSID object, an array, or { \"wlan-ssid\": [...] }");
+            }
+        } catch (e) {
+            throw new Error(`Failed to parse payload JSON: ${e.message}`);
+        }
+
+        if (ssidList.length === 0) {
+            return "⚠️  No SSID entries found in the supplied payload.";
+        }
+
+        // ── analyse each SSID ─────────────────────────────────────────────────
+        const reportLines = [
+            `╔══════════════════════════════════════════════════════════════════╗`,
+            `║         WLAN SSID Best-Practice Analysis Report                  ║`,
+            `╚══════════════════════════════════════════════════════════════════╝`,
+            ``
+        ];
+
+        for (const ssid of ssidList) {
+            const name = ssid.ssid ?? ssid.essid?.name ?? "(unnamed)";
+            const issues  = [];  // ❌ FAIL
+            const warns   = [];  // ⚠️  WARNING
+            const infos   = [];  // ℹ️  ADVISORY / INFO
+            const passes  = [];  // ✅ PASS
+
+            // ── 1. broadcast-filter-ipv4 ────────────────────────────────────
+            const bfv4 = ssid["broadcast-filter-ipv4"] ?? null;
+            if (!bfv4 || bfv4 === "NONE" || bfv4 === "BCAST_FILTER_NONE") {
+                issues.push(
+                    `broadcast-filter-ipv4 is "${bfv4 ?? "not set"}" — must be BCAST_FILTER_ARP or BCAST_FILTER_ALL.` +
+                    ` ARP flooding wastes airtime; enabling ARP filtering significantly reduces broadcast overhead.`
+                );
+            } else if (bfv4 === "BCAST_FILTER_ARP" || bfv4 === "BCAST_FILTER_ALL") {
+                passes.push(`broadcast-filter-ipv4 = ${bfv4} ✔`);
+            } else {
+                warns.push(`broadcast-filter-ipv4 = "${bfv4}" — expected BCAST_FILTER_ARP or BCAST_FILTER_ALL. Verify this is intentional.`);
+            }
+
+            // ── 2. dot11r (Fast BSS Transition) ────────────────────────────
+            const dot11r = ssid["dot11r"];
+            if (dot11r === true) {
+                warns.push(
+                    `dot11r (802.11r Fast Roaming) is ENABLED.` +
+                    ` Best practice recommends dot11r = false unless all clients are confirmed compatible.` +
+                    ` Older or IoT devices often fail to associate when 802.11r is active.`
+                );
+            } else if (dot11r === false) {
+                passes.push(`dot11r = false ✔`);
+            } else {
+                infos.push(`dot11r is not explicitly set — defaults to false on most platforms. Recommend setting explicitly to false.`);
+            }
+
+            // ── 3. dot11k (Neighbor Reports) ───────────────────────────────
+            const dot11k = ssid["dot11k"];
+            if (dot11k === true) {
+                passes.push(`dot11k = true ✔ (Neighbor Reports enabled — aids roaming decisions)`);
+            } else if (dot11k === false) {
+                infos.push(
+                    `dot11k (802.11k Neighbor Reports) is DISABLED.` +
+                    ` It is optional but recommended — clients use neighbor reports to make better roaming decisions.`
+                );
+            } else {
+                infos.push(`dot11k is not explicitly set. Recommend enabling for improved roaming assistance.`);
+            }
+
+            // ── 4. Legacy rates — g-band ────────────────────────────────────
+            const gRates = ssid["g-legacy-rates"] ?? {};
+            const gBasicMin = minRate(gRates["basic-rates"]);
+            const gTxMin    = minRate(gRates["tx-rates"]);
+
+            if (gBasicMin === null) {
+                warns.push(`g-legacy-rates.basic-rates is not set. Recommend minimum 24 Mbps (RATE_24MB) as lowest basic rate.`);
+            } else if (gBasicMin < 24) {
+                issues.push(
+                    `g-legacy-rates.basic-rates lowest rate is ${gBasicMin} Mbps (${gRates["basic-rates"]?.[0]}).` +
+                    ` Minimum should be 24 Mbps. Low basic rates allow slow legacy clients to monopolise airtime.`
+                );
+            } else {
+                passes.push(`g-legacy-rates.basic-rates minimum = ${gBasicMin} Mbps ✔`);
+            }
+
+            if (gTxMin === null) {
+                warns.push(`g-legacy-rates.tx-rates is not set. Recommend minimum 24 Mbps.`);
+            } else if (gTxMin < 24) {
+                issues.push(
+                    `g-legacy-rates.tx-rates lowest rate is ${gTxMin} Mbps.` +
+                    ` Minimum should be 24 Mbps to avoid airtime waste from slower data rates.`
+                );
+            } else {
+                passes.push(`g-legacy-rates.tx-rates minimum = ${gTxMin} Mbps ✔`);
+            }
+
+            // ── 5. Legacy rates — a-band ────────────────────────────────────
+            const aRates = ssid["a-legacy-rates"] ?? {};
+            const aBasicMin = minRate(aRates["basic-rates"]);
+            const aTxMin    = minRate(aRates["tx-rates"]);
+
+            if (aBasicMin === null) {
+                warns.push(`a-legacy-rates.basic-rates is not set. Recommend minimum 24 Mbps as lowest basic rate.`);
+            } else if (aBasicMin < 24) {
+                issues.push(
+                    `a-legacy-rates.basic-rates lowest rate is ${aBasicMin} Mbps.` +
+                    ` Minimum should be 24 Mbps.`
+                );
+            } else {
+                passes.push(`a-legacy-rates.basic-rates minimum = ${aBasicMin} Mbps ✔`);
+            }
+
+            if (aTxMin === null) {
+                warns.push(`a-legacy-rates.tx-rates is not set. Recommend minimum 24 Mbps.`);
+            } else if (aTxMin < 24) {
+                issues.push(
+                    `a-legacy-rates.tx-rates lowest rate is ${aTxMin} Mbps.` +
+                    ` Minimum should be 24 Mbps.`
+                );
+            } else {
+                passes.push(`a-legacy-rates.tx-rates minimum = ${aTxMin} Mbps ✔`);
+            }
+
+            // ── 6. opmode ──────────────────────────────────────────────────
+            const opmode = ssid["opmode"] ?? null;
+            if (!opmode) {
+                warns.push(`opmode is not set. Recommend WPA3_SAE for new deployments.`);
+            } else if (INSECURE_MODES.has(opmode.toUpperCase())) {
+                issues.push(
+                    `opmode = "${opmode}" is INSECURE (open/WEP).` +
+                    ` Use WPA3_SAE, WPA3_SAE_ECC, or at minimum WPA2_PSK_AES.`
+                );
+            } else if (WPA3_MODES.has(opmode)) {
+                passes.push(`opmode = ${opmode} ✔ (WPA3 — recommended)`);
+            } else if (opmode.includes("WPA2")) {
+                warns.push(
+                    `opmode = "${opmode}" is WPA2.` +
+                    ` Consider upgrading to WPA3_SAE for stronger security and improved key management (SAE replaces PSK handshake).`
+                );
+            } else {
+                infos.push(`opmode = "${opmode}" — verify this is the intended security mode.`);
+            }
+
+            // ── 7. wpa3-transition-mode-enable ─────────────────────────────
+            const transMode = ssid["wpa3-transition-mode-enable"];
+            if (transMode === true) {
+                infos.push(
+                    `wpa3-transition-mode-enable = true.` +
+                    ` This allows WPA2/WPA3 mixed clients on the same SSID.` +
+                    ` ACTION REQUIRED: Query associated clients on this SSID and identify any that are connecting via WPA2 (not WPA3).` +
+                    ` Once all clients support WPA3, disable transition mode and set opmode = WPA3_SAE for full WPA3-only enforcement.` +
+                    ` Use the monitoring API (e.g. /network-monitoring/v1/clients) to list client security capabilities.`
+                );
+            } else if (transMode === false || transMode === undefined || transMode === null) {
+                if (opmode && WPA3_MODES.has(opmode)) {
+                    passes.push(`wpa3-transition-mode-enable = false — pure WPA3 mode enforced ✔`);
+                }
+                // If not WPA3, no comment needed
+            }
+
+            // ── 8. auth-req-thresh ──────────────────────────────────────────
+            const authThresh = ssid["auth-req-thresh"] ?? null;
+            if (authThresh === null || authThresh === undefined) {
+                warns.push(
+                    `auth-req-thresh is not set.` +
+                    ` Recommend setting to at least 20 to protect APs from authentication storms.`
+                );
+            } else if (authThresh === 0) {
+                warns.push(
+                    `auth-req-thresh = 0 (unlimited). This means no rate limiting on auth requests.` +
+                    ` Recommend setting to ≥ 20 (auth requests per second per AP) to prevent association floods.`
+                );
+            } else if (authThresh < 20) {
+                warns.push(
+                    `auth-req-thresh = ${authThresh} — below recommended minimum of 20.` +
+                    ` Low values may throttle legitimate clients during high-density events.` +
+                    ` Consider raising to 20–50 depending on expected client density.`
+                );
+            } else {
+                passes.push(`auth-req-thresh = ${authThresh} ✔ (≥ 20)`);
+            }
+
+            // ── build SSID section ─────────────────────────────────────────
+            const totalIssues = issues.length;
+            const totalWarns  = warns.length;
+            const totalPasses = passes.length;
+
+            let overallStatus;
+            if (totalIssues > 0) overallStatus = "❌ NEEDS ATTENTION";
+            else if (totalWarns > 0) overallStatus = "⚠️  WARNINGS";
+            else overallStatus = "✅ ALL CHECKS PASSED";
+
+            reportLines.push(`┌─────────────────────────────────────────────────────────────────┐`);
+            reportLines.push(`│ SSID: ${name.padEnd(58)}│`);
+            reportLines.push(`│ Status: ${overallStatus.padEnd(56)}│`);
+            reportLines.push(`├─────────────────────────────────────────────────────────────────┤`);
+
+            // Summary line
+            reportLines.push(`│ Passes: ${String(totalPasses).padStart(2)}  │  Issues: ${String(totalIssues).padStart(2)}  │  Warnings: ${String(totalWarns).padStart(2)}  │  Info: ${String(infos.length).padStart(2)}         │`);
+            reportLines.push(`└─────────────────────────────────────────────────────────────────┘`);
+            reportLines.push(``);
+
+            // SSID details
+            reportLines.push(`  SSID Details:`);
+            reportLines.push(`    • opmode              : ${ssid["opmode"] ?? "not set"}`);
+            reportLines.push(`    • enable              : ${ssid["enable"] ?? "not set"}`);
+            reportLines.push(`    • rf-band             : ${ssid["rf-band"] ?? "not set"}`);
+            reportLines.push(`    • forward-mode        : ${ssid["forward-mode"] ?? "not set"}`);
+            reportLines.push(`    • broadcast-filter-v4 : ${ssid["broadcast-filter-ipv4"] ?? "not set"}`);
+            reportLines.push(`    • dot11r              : ${ssid["dot11r"] ?? "not set"}`);
+            reportLines.push(`    • dot11k              : ${ssid["dot11k"] ?? "not set"}`);
+            reportLines.push(`    • auth-req-thresh     : ${ssid["auth-req-thresh"] ?? "not set"}`);
+            reportLines.push(`    • wpa3-transition     : ${ssid["wpa3-transition-mode-enable"] ?? "not set"}`);
+
+            const gBasicRates = gRates["basic-rates"]?.join(", ") ?? "not set";
+            const gTxRates    = gRates["tx-rates"]?.join(", ")    ?? "not set";
+            const aBasicRates = aRates["basic-rates"]?.join(", ") ?? "not set";
+            const aTxRates    = aRates["tx-rates"]?.join(", ")    ?? "not set";
+            reportLines.push(`    • g basic-rates       : ${gBasicRates}`);
+            reportLines.push(`    • g tx-rates          : ${gTxRates}`);
+            reportLines.push(`    • a basic-rates       : ${aBasicRates}`);
+            reportLines.push(`    • a tx-rates          : ${aTxRates}`);
+            reportLines.push(``);
+
+            if (issues.length > 0) {
+                reportLines.push(`  ❌ ISSUES (must fix):`);
+                issues.forEach((msg, i) => reportLines.push(`    ${i + 1}. ${msg}`));
+                reportLines.push(``);
+            }
+
+            if (warns.length > 0) {
+                reportLines.push(`  ⚠️  WARNINGS (strongly recommended):`);
+                warns.forEach((msg, i) => reportLines.push(`    ${i + 1}. ${msg}`));
+                reportLines.push(``);
+            }
+
+            if (infos.length > 0) {
+                reportLines.push(`  ℹ️  ADVISORY / INFO:`);
+                infos.forEach((msg, i) => reportLines.push(`    ${i + 1}. ${msg}`));
+                reportLines.push(``);
+            }
+
+            if (passes.length > 0) {
+                reportLines.push(`  ✅ PASSED:`);
+                passes.forEach((msg) => reportLines.push(`    • ${msg}`));
+                reportLines.push(``);
+            }
+
+            reportLines.push(``);
+        }
+
+        // ── global summary ─────────────────────────────────────────────────────
+        reportLines.push(`══════════════════════════════════════════════════════════════════`);
+        reportLines.push(`  Total SSIDs analysed : ${ssidList.length}`);
+        reportLines.push(`══════════════════════════════════════════════════════════════════`);
+        reportLines.push(`  Quick-reference best-practice rules:`);
+        reportLines.push(`    • broadcast-filter-ipv4 → BCAST_FILTER_ARP or BCAST_FILTER_ALL`);
+        reportLines.push(`    • dot11r               → false (compatibility)`);
+        reportLines.push(`    • dot11k               → true  (optional but recommended)`);
+        reportLines.push(`    • g/a basic-rates      → lowest ≥ 24 Mbps`);
+        reportLines.push(`    • g/a tx-rates         → lowest ≥ 24 Mbps`);
+        reportLines.push(`    • opmode               → WPA3_SAE / WPA3_SAE_ECC recommended`);
+        reportLines.push(`    • auth-req-thresh      → ≥ 20`);
+        reportLines.push(`══════════════════════════════════════════════════════════════════`);
+
+        return reportLines.join("\n");
+    }
+});
+
 // เปิดการเชื่อมต่อ
 server.start();
 
